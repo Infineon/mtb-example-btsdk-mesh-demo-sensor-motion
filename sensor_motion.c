@@ -72,6 +72,7 @@
 #include "wiced_bt_cfg.h"
 #include "wiced_hal_mia.h"
 #include "wiced_hal_mia.h"
+#include "GeneratedSource/cycfg_pins.h"
 
 extern wiced_bt_cfg_settings_t wiced_bt_cfg_settings;
 
@@ -102,8 +103,8 @@ extern wiced_bt_cfg_settings_t wiced_bt_cfg_settings;
  ******************************************************/
 e93196_usr_cfg_t e93196_usr_cfg =
 {
-    .doci_pin           = WICED_P05,                                /* Interrupt/Data output Clock input configure pin          */
-    .serin_pin          = WICED_P17,                                /* Serial Input configure pin                               */
+    .doci_pin           = CYBSP_INT_DOCI,                             /* Interrupt/Data output Clock input configure pin          */
+    .serin_pin          = CYBSP_SERIN,                                /* Serial Input configure pin                               */
     .e93196_init_reg    =
     {
         .sensitivity    = 0x10,                                     /* [24:17]sensitivity,   [Register Value] * 6.5uV           */
@@ -420,7 +421,9 @@ void mesh_app_init(wiced_bool_t is_provisioned)
         app_state.lpn_sleep_config.device_wake_gpio_num = e93196_usr_cfg.doci_pin;
         app_state.lpn_sleep_config.host_wake_mode = WICED_SLEEP_WAKE_ACTIVE_HIGH;
         app_state.lpn_sleep_config.sleep_permit_handler = mesh_sensor_motion_sleep_poll;
+#if defined(CYW20819A1) || defined(CYW20820A1)
         app_state.lpn_sleep_config.post_sleep_cback_handler = NULL;
+#endif
 
         if (WICED_BT_SUCCESS != wiced_sleep_configure(&app_state.lpn_sleep_config))
         {

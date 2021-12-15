@@ -47,7 +47,8 @@ VERBOSE=
 TARGET=CYBT-213043-MESH
 
 SUPPORTED_TARGETS = \
-  CYBT-213043-MESH
+  CYBT-213043-MESH \
+  CYBLE-343072-MESH
 
 #
 # Advanced Configuration
@@ -90,8 +91,10 @@ CY_APP_DEFINES += -DREMOTE_PROVISION_SERVER_SUPPORTED
 endif
 
 # value of the LOW_POWER_NODE defines mode. It can be normal node (0), or low power node (1)
+ifeq ($(filter $(TARGET), CYBLE-343072-MESH),)
 LOW_POWER_NODE ?= 0
 CY_APP_DEFINES += -DLOW_POWER_NODE=$(LOW_POWER_NODE)
+endif
 
 # If PTS is defined then device gets hardcoded BD address from make target
 # Otherwise it is random for all mesh apps.
