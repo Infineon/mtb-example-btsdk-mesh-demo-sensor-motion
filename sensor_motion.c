@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2021, Cypress Semiconductor Corporation (an Infineon company) or
+ * Copyright 2016-2022, Cypress Semiconductor Corporation (an Infineon company) or
  * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
  *
  * This software, including source code, documentation and related
@@ -95,8 +95,8 @@ extern wiced_bt_cfg_settings_t wiced_bt_cfg_settings;
 
 #define MESH_MOTION_SENSOR_CADENCE_VSID_START           WICED_NVRAM_VSID_START
 
-// After presence is detected, interrupts are disabled for 5 seconds
-#define MESH_PRESENCE_DETECTED_BLIND_TIME               5
+// After presence is detected, interrupts are disabled for 7 seconds
+#define MESH_PRESENCE_DETECTED_BLIND_TIME               7
 
 /******************************************************
  *          Structures
@@ -149,6 +149,8 @@ static void         mesh_sensor_server_process_setting_changed(uint8_t element_i
 static void         mesh_sensor_publish_timer_callback(TIMER_PARAM_TYPE arg);
 static void         e93196_int_proc(void *data, uint8_t port_pin);
 static void         mesh_sensor_presence_detected_timer_callback(TIMER_PARAM_TYPE arg);
+static void         mesh_sensor_publish(void);
+static void         mesh_sensor_value_changed(wiced_bt_mesh_core_config_sensor_t* p_sensor);
 static int32_t      mesh_sensor_get_current_value(void);
 static void         mesh_app_factory_reset(void);
 
@@ -169,10 +171,10 @@ uint8_t mesh_model_num[WICED_BT_MESH_PROPERTY_LEN_DEVICE_MODEL_NUMBER]          
 uint8_t mesh_prop_fw_version[WICED_BT_MESH_PROPERTY_LEN_DEVICE_FIRMWARE_REVISION] =   { '0', '6', '.', '0', '2', '.', '0', '5' }; // this is overwritten during init
 uint8_t mesh_system_id[8]                                                           = { 0xbb, 0xb8, 0xa1, 0x80, 0x5f, 0x9f, 0x91, 0x71 };
 
-int32_t       mesh_sensor_sent_value = 0;          //
-int32_t       mesh_sensor_current_value = 0;
-uint32_t      mesh_sensor_sent_time;               // time stamp when data was published
-uint32_t      mesh_sensor_publish_period = 320000; // 0;  // publish "no presence" every ~5 minutes, with fast cadence 32. This is reset to 0 after provisioning.  Set here for testing.
+int32_t       mesh_sensor_sent_value = 0;          // Value that was sent, it can be different than pub_value due to GET
+int32_t       mesh_sensor_pub_value;               // value that has been published
+uint32_t      mesh_sensor_pub_time;                // time stamp when data was published
+uint32_t      mesh_sensor_publish_period = 0;      // publish "no presence" every ~5 minutes, with fast cadence 32. This is reset to 0 after provisioning.  Set here for testing.
                                                    // we will publish "presence" every 10 seconds.
 uint32_t      mesh_sensor_fast_publish_period = 0; // publish period in msec when values are outside of limit
 wiced_timer_t mesh_sensor_cadence_timer;
@@ -207,12 +209,12 @@ wiced_bt_mesh_core_config_sensor_t mesh_element1_sensors[] =
         .cadence =
         {
             // Value 0 indicates that cadence does not change depending on the measurements
-            .fast_cadence_period_divisor = 32,          // Recommended publish period is 320sec, 32 will make fast period 10sec
+            .fast_cadence_period_divisor = 1,           // Recommended publish period is 320sec, 32 will make fast period 10sec
             .trigger_type_percentage     = WICED_FALSE, // The Property is Bool, does not make sense to use percentage
             .trigger_delta_down          = 0,           // This will not cause message when presence changes from 1 to 0
-            .trigger_delta_up            = 1,           // This will cause immediate message when presence changes from 0 to 1
+            .trigger_delta_up            = 0,           // This will cause immediate message when presence changes from 0 to 1
             .min_interval                = (1 << 10),   // Milliseconds. Conversion to SPEC values is done by the mesh models library
-            .fast_cadence_low            = 1,           // If fast_cadence_low is greater than fast_cadence_high and the measured value is either is lower
+            .fast_cadence_low            = 0,           // If fast_cadence_low is greater than fast_cadence_high and the measured value is either is lower
                                                         // than fast_cadence_high or higher than fast_cadence_low, then the message shall be published
                                                         // with publish period (equals to mesh_sensor_publish_period divided by fast_cadence_divisor_period)
             .fast_cadence_high           = 0,           // is more or equal cadence_low or less then cadence_high. This is what we need.
@@ -448,6 +450,9 @@ wiced_bool_t mesh_app_notify_period_set(uint8_t element_idx, uint16_t company_id
     mesh_sensor_publish_period = period;
     WICED_BT_TRACE("Sensor data send period:%dms\n", mesh_sensor_publish_period);
     mesh_sensor_server_restart_timer(&mesh_config.elements[element_idx].sensors[MESH_MOTION_SENSOR_INDEX]);
+
+    // as we are restarting time, we will publish on the first expiration regardless on when the value was previously published
+    mesh_sensor_pub_time = 0;
     return WICED_TRUE;
 }
 
@@ -460,7 +465,7 @@ void mesh_sensor_server_restart_timer(wiced_bt_mesh_core_config_sensor_t *p_sens
     uint32_t timeout = mesh_sensor_publish_period;
 
     wiced_stop_timer(&mesh_sensor_cadence_timer);
-    if (mesh_sensor_publish_period == 0)
+    if (timeout == 0)
     {
         WICED_BT_TRACE("sensor restart timer period:%d\n", mesh_sensor_publish_period);
         return;
@@ -469,13 +474,14 @@ void mesh_sensor_server_restart_timer(wiced_bt_mesh_core_config_sensor_t *p_sens
     // often than publication period.  Publish if measurement is in specified range
     if (p_sensor->cadence.fast_cadence_period_divisor > 1)
     {
-        mesh_sensor_fast_publish_period = mesh_sensor_publish_period / p_sensor->cadence.fast_cadence_period_divisor;
-        timeout = mesh_sensor_fast_publish_period;
+        timeout = mesh_sensor_publish_period / p_sensor->cadence.fast_cadence_period_divisor;
+        mesh_sensor_fast_publish_period = timeout ;
         WICED_BT_TRACE("sensor fast cadence:%d\n", mesh_sensor_fast_publish_period);
     }
     else
     {
         mesh_sensor_fast_publish_period = 0;
+        WICED_BT_TRACE("sensor fast pub period:0 cadence devisor:%d\n", p_sensor->cadence.fast_cadence_period_divisor);
     }
     // should not send data more often than min_interval
     if ((p_sensor->cadence.min_interval != 0) && (p_sensor->cadence.min_interval > timeout) &&
@@ -573,6 +579,9 @@ void mesh_sensor_server_process_cadence_changed(uint8_t element_idx, uint16_t pr
     WICED_BT_TRACE("NVRAM write: %d\n", written_byte);
 
     mesh_sensor_server_restart_timer(p_sensor);
+
+    // as we are restarting time, we will publish on the first expiration regardless on when the value was previously published
+    mesh_sensor_pub_time = 0;
 }
 
 /*
@@ -585,18 +594,17 @@ void mesh_sensor_publish_timer_callback(TIMER_PARAM_TYPE arg)
     wiced_bt_mesh_event_t *p_event;
     wiced_bt_mesh_core_config_sensor_t *p_sensor = (wiced_bt_mesh_core_config_sensor_t *)arg;
     wiced_bool_t pub_needed = WICED_FALSE;
-    uint32_t cur_time = wiced_bt_mesh_core_get_tick_count();
+    uint32_t current_time = wiced_bt_mesh_core_get_tick_count();
+    int32_t current_value = mesh_sensor_get_current_value();
 
-    mesh_sensor_current_value = mesh_sensor_get_current_value();
-
-    if ((p_sensor->cadence.min_interval != 0) && ((cur_time - mesh_sensor_sent_time) < p_sensor->cadence.min_interval))
+    if ((p_sensor->cadence.min_interval != 0) && ((current_time - mesh_sensor_pub_time) < p_sensor->cadence.min_interval))
     {
-        WICED_BT_TRACE("time since last pub:%d less then cadence interval:%d\n", cur_time - mesh_sensor_sent_time, p_sensor->cadence.min_interval);
+        WICED_BT_TRACE("time since last pub:%d less then cadence interval:%d\n", current_time - mesh_sensor_pub_time, p_sensor->cadence.min_interval);
     }
     else
     {
         // check if publication timer expired
-        if ((mesh_sensor_publish_period != 0) && (cur_time - mesh_sensor_sent_time >= mesh_sensor_publish_period))
+        if ((mesh_sensor_publish_period != 0) && (current_time - mesh_sensor_pub_time >= mesh_sensor_publish_period))
         {
             WICED_BT_TRACE("Pub needed period\n");
             pub_needed = WICED_TRUE;
@@ -608,10 +616,10 @@ void mesh_sensor_publish_timer_callback(TIMER_PARAM_TYPE arg)
             if (!p_sensor->cadence.trigger_type_percentage)
             {
                 WICED_BT_TRACE("Native cur value:%d sent:%d delta:%d/%d\n",
-                        mesh_sensor_current_value, mesh_sensor_sent_value, p_sensor->cadence.trigger_delta_up, p_sensor->cadence.trigger_delta_down);
+                        current_value, mesh_sensor_pub_value, p_sensor->cadence.trigger_delta_up, p_sensor->cadence.trigger_delta_down);
 
-                if (((p_sensor->cadence.trigger_delta_up != 0)   && (mesh_sensor_current_value >= (mesh_sensor_sent_value + p_sensor->cadence.trigger_delta_up)))
-                 || ((p_sensor->cadence.trigger_delta_down != 0) && (mesh_sensor_current_value <= (mesh_sensor_sent_value - p_sensor->cadence.trigger_delta_down))))
+                if (((p_sensor->cadence.trigger_delta_up != 0)   && (current_value >= (mesh_sensor_pub_value + p_sensor->cadence.trigger_delta_up)))
+                 || ((p_sensor->cadence.trigger_delta_down != 0) && (current_value <= (mesh_sensor_pub_value - p_sensor->cadence.trigger_delta_down))))
                 {
                     WICED_BT_TRACE("Pub needed native value\n");
                     pub_needed = WICED_TRUE;
@@ -619,22 +627,22 @@ void mesh_sensor_publish_timer_callback(TIMER_PARAM_TYPE arg)
             }
             else
             {
-                // need to calculate percentage of the increase or decrease. The deltas are in 0.01%.
-                if (mesh_sensor_current_value > mesh_sensor_sent_value)
+                // need to calculate percentage of the increase or decrease.  The deltas are in 0.01%.
+                if ((p_sensor->cadence.trigger_delta_up != 0) && (current_value > mesh_sensor_pub_value))
                 {
-                    WICED_BT_TRACE("Delta up:%d\n", ((uint32_t)(mesh_sensor_current_value - mesh_sensor_sent_value) * 10000 / mesh_sensor_current_value));
-                    if (((uint32_t)(mesh_sensor_current_value - mesh_sensor_sent_value) * 10000 / mesh_sensor_current_value) > p_sensor->cadence.trigger_delta_up)
+                    WICED_BT_TRACE("Delta up:%d\n", ((uint32_t)(current_value - mesh_sensor_pub_value) * 10000 / current_value));
+                    if (((uint32_t)(current_value - mesh_sensor_pub_value) * 10000 / current_value) > p_sensor->cadence.trigger_delta_up)
                     {
-                        WICED_BT_TRACE("Pub needed percent delta up:%d\n", ((mesh_sensor_current_value - mesh_sensor_sent_value) * 10000 / mesh_sensor_current_value));
+                        WICED_BT_TRACE("Pub needed percent delta up:%d\n", ((current_value - mesh_sensor_pub_value) * 10000 / current_value));
                         pub_needed = WICED_TRUE;
                     }
                 }
-                else
+                else if ((p_sensor->cadence.trigger_delta_down != 0) && (current_value < mesh_sensor_pub_value))
                 {
-                    WICED_BT_TRACE("Delta down:%d\n", ((uint32_t)(mesh_sensor_sent_value - mesh_sensor_current_value) * 10000 / mesh_sensor_current_value));
-                    if (((uint32_t)(mesh_sensor_sent_value - mesh_sensor_current_value) * 10000 / mesh_sensor_current_value) > p_sensor->cadence.trigger_delta_down)
+                    WICED_BT_TRACE("Delta down:%d\n", ((uint32_t)(mesh_sensor_pub_value - current_value) * 10000 / current_value));
+                    if (((uint32_t)(mesh_sensor_pub_value - current_value) * 10000 / current_value) > p_sensor->cadence.trigger_delta_down)
                     {
-                        WICED_BT_TRACE("Pub needed percent delta down:%d\n", ((mesh_sensor_sent_value - mesh_sensor_current_value) * 10000 / mesh_sensor_current_value));
+                        WICED_BT_TRACE("Pub needed percent delta down:%d\n", ((mesh_sensor_pub_value - current_value) * 10000 / current_value));
                         pub_needed = WICED_TRUE;
                     }
                 }
@@ -644,13 +652,13 @@ void mesh_sensor_publish_timer_callback(TIMER_PARAM_TYPE arg)
         if (!pub_needed && (mesh_sensor_fast_publish_period != 0))
         {
             // check if fast publish period expired
-            if (cur_time - mesh_sensor_sent_time >= mesh_sensor_fast_publish_period)
+            if (current_time - mesh_sensor_pub_time >= mesh_sensor_fast_publish_period)
             {
                 // if cadence high is more than cadence low, to publish, the value should be in range
                 if (p_sensor->cadence.fast_cadence_high > p_sensor->cadence.fast_cadence_low)
                 {
-                    if ((mesh_sensor_current_value > p_sensor->cadence.fast_cadence_low) &&
-                        (mesh_sensor_current_value <= p_sensor->cadence.fast_cadence_high))
+                    if ((current_value > p_sensor->cadence.fast_cadence_low) &&
+                        (current_value <= p_sensor->cadence.fast_cadence_high))
                     {
                         WICED_BT_TRACE("Pub needed in range\n");
                         pub_needed = WICED_TRUE;
@@ -658,32 +666,27 @@ void mesh_sensor_publish_timer_callback(TIMER_PARAM_TYPE arg)
                 }
                 else if (p_sensor->cadence.fast_cadence_high < p_sensor->cadence.fast_cadence_low)
                 {
-                    if ((mesh_sensor_current_value >= p_sensor->cadence.fast_cadence_low) ||
-                        (mesh_sensor_current_value < p_sensor->cadence.fast_cadence_high))
+                    if ((current_value >= p_sensor->cadence.fast_cadence_low) ||
+                        (current_value < p_sensor->cadence.fast_cadence_high))
                     {
                         WICED_BT_TRACE("Pub needed out of range\n");
                         pub_needed = WICED_TRUE;
                     }
                 }
-            }
-        }
-        // We will still send publication if Deltas are not set, but measured value has changed.
-        if (!pub_needed && (p_sensor->cadence.trigger_delta_up == 0) && (p_sensor->cadence.trigger_delta_down == 0))
-        {
-            if (((p_sensor->cadence.trigger_delta_up == 0)   && (mesh_sensor_current_value > mesh_sensor_sent_value)) ||
-                ((p_sensor->cadence.trigger_delta_down == 0) && (mesh_sensor_current_value < mesh_sensor_sent_value)))
-            {
-               WICED_BT_TRACE("Pub needed new value no deltas\n");
-               pub_needed = WICED_TRUE;
+                else // p_sensor->cadence.fast_cadence_high == p_sensor->cadence.fast_cadence_low
+                {
+                    // publish if current value is the same as cadence high/low
+                    if (current_value == p_sensor->cadence.fast_cadence_low)
+                    {
+                        WICED_BT_TRACE("Pub needed equal\n");
+                        pub_needed = WICED_TRUE;
+                    }
+                }
             }
         }
         if (pub_needed)
         {
-            mesh_sensor_sent_value  = mesh_sensor_current_value;
-            mesh_sensor_sent_time   = cur_time;
-
-            WICED_BT_TRACE("*** Pub value:%d time:%d\n", mesh_sensor_sent_value, mesh_sensor_sent_time);
-            wiced_bt_mesh_model_sensor_server_data(MESH_SENSOR_SERVER_ELEMENT_INDEX, MESH_SENSOR_PROPERTY_ID, NULL);
+            mesh_sensor_publish();
         }
     }
     mesh_sensor_server_restart_timer(p_sensor);
@@ -709,15 +712,77 @@ void e93196_int_proc(void* data, uint8_t port_pin)
     if (!presence_detected)
     {
         presence_detected = WICED_TRUE;
-        mesh_sensor_publish_timer_callback((TIMER_PARAM_TYPE)&mesh_config.elements[MESH_SENSOR_SERVER_ELEMENT_INDEX].sensors[MESH_MOTION_SENSOR_INDEX]);
+        mesh_sensor_value_changed(&mesh_config.elements[MESH_SENSOR_SERVER_ELEMENT_INDEX].sensors[MESH_MOTION_SENSOR_INDEX]);
     }
 }
 
 void mesh_sensor_presence_detected_timer_callback(TIMER_PARAM_TYPE arg)
 {
-    WICED_BT_TRACE("presence detected timeout\n");
-    presence_detected = WICED_FALSE;
-    mesh_sensor_publish_timer_callback((TIMER_PARAM_TYPE)&mesh_config.elements[MESH_SENSOR_SERVER_ELEMENT_INDEX].sensors[MESH_MOTION_SENSOR_INDEX]);
+    WICED_BT_TRACE("presence detected FALSE\n");
+
+    if (presence_detected)
+    {
+        presence_detected = WICED_FALSE;
+        mesh_sensor_value_changed(&mesh_config.elements[MESH_SENSOR_SERVER_ELEMENT_INDEX].sensors[MESH_MOTION_SENSOR_INDEX]);
+    }
+}
+
+/*
+ * This funciton is executed when Sensor Value changes
+ */
+void mesh_sensor_value_changed(wiced_bt_mesh_core_config_sensor_t* p_sensor)
+{
+    int32_t current_value;
+    uint32_t current_time;
+
+    // If sensor is configured for periodic publication, don't need to do anything because
+    // value will be published on schedule
+    if (mesh_sensor_publish_period != 0)
+    {
+        WICED_BT_TRACE("sensor value change ignored will publish on timeout\n");
+        return;
+    }
+
+    // When periodic publishing is disabled, however, the behavior triggered by a change in
+    // the Sensor Data state shall depend on whether the Sensor Cadence state has been configured
+    if ((p_sensor->cadence.fast_cadence_period_divisor == 1) && (p_sensor->cadence.trigger_delta_up == 0) && (p_sensor->cadence.trigger_delta_down == 0))
+    {
+        // If Cadence is not configured we should publish on every change. Implementation needs to make sure that
+        // the value is not published too often, but in Motion Sensor it is not a problem because there is a blind timer involved.
+        mesh_sensor_publish();
+        return;
+    }
+
+    current_time = wiced_bt_mesh_core_get_tick_count();
+    if (mesh_sensor_pub_time + p_sensor->cadence.min_interval > current_time)
+    {
+        WICED_BT_TRACE("sensor value change min_interval not expired pub_time:%d current_time:%d\n", mesh_sensor_pub_time, current_time);
+        return;
+    }
+
+    // If cadence is configured, we will publish if conditions are setisifed
+    current_value = mesh_sensor_get_current_value();
+
+    if (((p_sensor->cadence.trigger_delta_down != 0) && (current_value < mesh_sensor_pub_value - p_sensor->cadence.trigger_delta_down)) ||
+        ((p_sensor->cadence.trigger_delta_up != 0) && (current_value > mesh_sensor_pub_value - p_sensor->cadence.trigger_delta_up)))
+    {
+        mesh_sensor_publish();
+        mesh_sensor_server_restart_timer(p_sensor);
+        return;
+    }
+}
+
+/*
+ * Publish Sensor Data
+ */
+void mesh_sensor_publish(void)
+{
+    mesh_sensor_sent_value = mesh_sensor_get_current_value();
+    mesh_sensor_pub_value = mesh_sensor_sent_value;
+    mesh_sensor_pub_time = wiced_bt_mesh_core_get_tick_count();
+
+    WICED_BT_TRACE("*** Pub value:%d time:%d\n", mesh_sensor_sent_value, mesh_sensor_pub_time);
+    wiced_bt_mesh_model_sensor_server_data(MESH_SENSOR_SERVER_ELEMENT_INDEX, MESH_SENSOR_PROPERTY_ID, NULL);
 }
 
 int32_t mesh_sensor_get_current_value(void)
